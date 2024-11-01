@@ -1,0 +1,68 @@
+{
+  "Axial_system": "OPENGL",
+  "cameras": [
+    {
+      "NameColor": "viewport",
+      "Position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "Rotation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "Depth_range": [
+        0.1,
+        30.0
+      ],
+      "Resolution": [
+        2560,
+        1440
+      ],
+      "Projection": "Perspective",
+      "Focal": [
+        2410.34,
+        2410.34
+      ],
+      "Principle_point": [
+        1280,
+        720
+      ]
+    },
+    {
+      "NameColor": "RGBA.png",
+      "NameDepth": "depth.png",
+      "Position": [
+        0.0,
+        0.0,
+        0
+      ],
+      "Rotation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "Depth_range": [
+        3,
+        4
+      ],
+      "Resolution": [
+        2560,
+        1440
+      ],
+      "Projection": "Perspective",
+      "Focal": [
+        2410.34,
+        2410.34
+      ],
+      "Principle_point": [
+        1280,
+        720
+      ],
+      "BitDepthColor": 8,
+      "BitDepthDepth": 8
+    }
+  ]
+}
