@@ -1,0 +1,4 @@
+/home/zhike/公共的/x30032372/Depth-Anything-V2/cpp/pt/build/CMakeFiles/depth.dir
+/home/zhike/公共的/x30032372/Depth-Anything-V2/cpp/pt/build/CMakeFiles/main.dir
+/home/zhike/公共的/x30032372/Depth-Anything-V2/cpp/pt/build/CMakeFiles/edit_cache.dir
+/home/zhike/公共的/x30032372/Depth-Anything-V2/cpp/pt/build/CMakeFiles/rebuild_cache.dir
