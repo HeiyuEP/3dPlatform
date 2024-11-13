@@ -1,0 +1,331 @@
+diff --git a/src/video.cpp b/src/video.cpp
+index 8c5829a..f5f2d37 100644
+--- a/src/video.cpp
++++ b/src/video.cpp
+@@ -26,6 +26,22 @@ extern "C" {
+ #include "sync.h"
+ #include "video.h"
+ 
++#include <iostream>
++#include <cstdlib>
++#include <string>
++#include <opencv2/opencv.hpp>
++#include <fstream>
++#include <chrono>
++#include "GenerateDepthImg.h"
++
++#define SUNSHINE_HARDWARD_ENCODE
++
++extern int DIBRFlagTest(uint8_t* colorData, uint8_t* depthData, uint8_t** resultImg, bool outputLeft, uint8_t flag);
++int MAX_CAPTURE_FRAME_COUNT = 20;
++static int depthToDibrCount = 0;
++std::mutex queueMutex;
++std::condition_variable dataCondition;
++
+ #ifdef _WIN32
+ extern "C" {
+   #include <libavutil/hwcontext_d3d11va.h>
+@@ -1063,6 +1079,38 @@ namespace video {
+     }
+   }
+ 
++  void concatenate_filp_images(uint8_t* data1, uint8_t* data2, int width, int height, int channels, uint8_t** new_data) {
++    int new_width = width * 2;
++    *new_data = new uint8_t[new_width*height*channels];
++    for (int y=0;y<height;++y) {
++      int src_y = height - 1 - y;
++      uint8_t* row1 = data1 + (src_y*width*channels);
++      uint8_t* row2 = data2 + (src_y*width*channels);
++
++      uint8_t* new_row = *new_data + (y*new_width*channels);
++      memcpy(new_row, row1, width*channels); // 左半部分
++      memcpy(new_row+(width*channels),row2,width*channels); // 右半部分
++    }
++  }
++
++  void resize_image(uint8_t* input_data, int input_width, int input_height, int channels, uint8_t** output_data, int output_width) {
++    *output_data = new uint8_t[output_width*input_height*channels];
++
++    float scale = static_cast<float>(input_width) / output_width;
++
++    for (int y=0; y<input_height ; ++y) {
++      for (int x=0;x<output_width;++x) {
++        int src_x = static_cast<int>(x*scale);
++        src_x = std::min(src_x, input_width-1);
++        uint8_t* src_pixel = input_data + (y*input_width*channels)+(src_x*channels);
++        uint8_t* dest_pixel = (*output_data) + (y*output_width*channels)+(x*channels);
++        for (int c=0; c<channels;++c) {
++          dest_pixel[c] = src_pixel[c];
++        }
++      }
++    }
++  }
++
+   void
+   captureThread(
+     std::shared_ptr<safe::queue_t<capture_ctx_t>> capture_ctx_queue,
+@@ -1319,6 +1367,9 @@ namespace video {
+ 
+   int
+   encode_avcodec(int64_t frame_nr, avcodec_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
++    printf("[INFO] encode_avcodec...\n");
++    auto timeA = std::chrono::high_resolution_clock::now();
++
+     auto &frame = session.device->frame;
+     frame->pts = frame_nr;
+ 
+@@ -1342,6 +1393,10 @@ namespace video {
+ 
+       ret = avcodec_receive_packet(ctx.get(), av_packet);
+       if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
++        std::cout << "[INFO] encode_avcodec: AVERROR(EAGAIN) or AVERROR_EOF" << std::endl;
++        auto timeB = std::chrono::high_resolution_clock::now();
++        std::chrono::duration<double, std::milli> timeCostEncode = timeB - timeA;
++        printf("[INFO] timeCost_Encode: %f ms\n", timeCostEncode.count());
+         return 0;
+       }
+       else if (ret < 0) {
+@@ -1394,6 +1449,7 @@ namespace video {
+ 
+   int
+   encode_nvenc(int64_t frame_nr, nvenc_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
++    printf("[INFO] encode_nvenc...\n");
+     auto encoded_frame = session.encode_frame(frame_nr);
+     if (encoded_frame.data.empty()) {
+       BOOST_LOG(error) << "NvENC returned empty packet";
+@@ -1809,6 +1865,167 @@ namespace video {
+     return nullptr;
+   }
+ 
++  void get_depth_img(img_event_t images, img_event_t depthImages, img_event_t src3Images, config_t config) {
++    int w = 1920;
++    int h = 1080;
++    GenerateDepthImg* depth = new GenerateDepthImg(w,h,4);
++    size_t srcSize = w*h*4;
++    std::uint8_t *srcData = new uint8_t[srcSize];
++    size_t src3Size = w*h*3;
++    std::uint8_t *src3Data = new uint8_t[src3Size];
++    size_t depthSize = w*h;
++    std::uint8_t *depthData = new uint8_t[depthSize];
++
++    auto minimum_frame_time = std::chrono::milliseconds(1000 / std::min(config.framerate, (config::video.min_fps_factor * 10)));
++    std::chrono::duration<double, std::milli> timeCostGetDepthImg;
++
++    int doDepthV2 = false;
++    while(depthToDibrCount < MAX_CAPTURE_FRAME_COUNT) {
++      auto timeA = std::chrono::high_resolution_clock::now();
++
++      if (auto img = images->pop(minimum_frame_time)) {
++        std::shared_ptr<platf::img_t> depthImage = std::make_shared<platf::img_t>();
++        std::shared_ptr<platf::img_t> src3Image = std::make_shared<platf::img_t>();
++        depthImage->data = new uint8_t[depthSize];
++        src3Image->data = new uint8_t[src3Size];
++
++        doDepthV2 = true;
++        
++        if(img->data!=NULL) {
++            memcpy(srcData, img->data, srcSize);
++        }
++        depth->Execute(srcData, src3Data, depthData);
++
++        std::cout << "row_pitch " << img->row_pitch << std::endl;
++
++        depthImage->width = img->width;
++        depthImage->height = img->height;
++        depthImage->pixel_pitch = 1;
++        depthImage->row_pitch = img->width * depthImage->pixel_pitch;
++        depthImage->frame_timestamp = img->frame_timestamp;
++        memcpy(depthImage->data, depthData, depthSize);
++
++        src3Image->width = img->width;
++        src3Image->height = img->height;
++        src3Image->pixel_pitch = 3;
++        src3Image->row_pitch = img->width * src3Image->pixel_pitch;
++        src3Image->frame_timestamp = img->frame_timestamp;
++        memcpy(src3Image->data, src3Data, src3Size);
++
++        std::cout << "[INFO] get_depth_img:Ready for Raise." << std::endl;
++        std::lock_guard<std::mutex> lock(queueMutex);
++        depthImages->raise(depthImage);
++        src3Images->raise(src3Image);
++        depthToDibrCount++;
++        printf("[INFO] get_depth_img:depthToDibrCount=%d\n", depthToDibrCount);
++        dataCondition.notify_one();
++        std::cout << "[INFO] get_depth_img:Raise completed." << std::endl;
++      }
++      if (doDepthV2) {
++        auto timeB = std::chrono::high_resolution_clock::now();
++        timeCostGetDepthImg = timeB - timeA;
++        std::cout << "[INFO] timeCostGetDepthImg: " << timeCostGetDepthImg.count() << " ms\n";
++      }
++      
++      doDepthV2 = false;
++    }
++    if (depthData != NULL) {
++        delete depthData;
++        depthData = NULL;
++    }
++    if (srcData != NULL) {
++        delete srcData;
++        srcData = NULL;
++    }
++    if (src3Data != NULL) {
++        delete src3Data;
++        src3Data = NULL;
++    }
++    delete depth;
++  }
++
++  void get_3D_img(img_event_t resImgs, img_event_t depthImages, img_event_t src3Images, config_t config) {
++    int leftInitRet = DIBRFlagTest(nullptr, nullptr,nullptr,1,0);
++    int rightInitRet = DIBRFlagTest(nullptr, nullptr,nullptr,0,0);
++    if (leftInitRet || rightInitRet) {
++      printf("[ERROR] leftInitRet is %d,  rightInitRet is %d.\n", leftInitRet, rightInitRet);
++      return;
++    }
++
++    auto minimum_frame_time = std::chrono::milliseconds(1000 / std::min(config.framerate, (config::video.min_fps_factor * 10)));
++    std::cout << "minimum_frame_time:" << minimum_frame_time.count() << std::endl;
++    std::cout << "config.framerate:" << config.framerate << std::endl;
++    std::cout << "config::video.min_fps_factor:" << config::video.min_fps_factor << std::endl;
++
++    std::chrono::duration<double, std::milli> timeCostGet3DImg;
++
++    while (true) {
++      std::unique_lock<std::mutex> lock(queueMutex);
++      dataCondition.wait(lock, [] { return (depthToDibrCount > 0); });
++      while (depthToDibrCount > 0) {
++        auto timeA = std::chrono::high_resolution_clock::now();
++        auto depthImage = depthImages->pop(minimum_frame_time);
++        auto src3Image = src3Images->pop(minimum_frame_time);
++        lock.unlock();
++        printf("[INFO] get_3D_img:depthToDibrCount=%d\n", depthToDibrCount);
++        depthToDibrCount--;
++        if (depthImage->data == NULL || src3Image->data == NULL) {
++          printf("[ERROR] depthImage->data or src3Image->data == NULL\n");
++          break;
++        }
++
++        uint8_t* left3dResult = NULL;
++        int retLeft = DIBRFlagTest(src3Image->data, depthImage->data,&left3dResult,1,1);
++        uint8_t* right3dResult = NULL;
++        int retRight = DIBRFlagTest(src3Image->data, depthImage->data,&right3dResult,0,1);
++        printf("[INFO] retLeft:%d, retRight:%d\n", retLeft, retRight);
++        delete src3Image->data;
++        delete depthImage->data;
++
++        if (retLeft == 0 && retRight == 0 && left3dResult != NULL && right3dResult != NULL) {
++          uint8_t* concatedImgData = nullptr;
++          concatenate_filp_images(left3dResult, right3dResult, src3Image->width, src3Image->height, 4, &concatedImgData);
++          printf("[INFO] concatenate_filp_images\n");
++
++          uint8_t* resizedImgData = nullptr;
++          resize_image(concatedImgData, src3Image->width*2, src3Image->height, 4, &resizedImgData, src3Image->width);
++          printf("[INFO] resize_image\n");
++
++          std::shared_ptr<platf::img_t> resImg = std::make_shared<platf::img_t>();
++          resImg->data = new uint8_t[src3Image->width*src3Image->height*4];
++          resImg->width = src3Image->width;
++          resImg->height = src3Image->height;
++          resImg->pixel_pitch = 4;
++          resImg->row_pitch = src3Image->width * 4;
++          resImg->frame_timestamp = src3Image->frame_timestamp;
++          memcpy(resImg->data, resizedImgData, src3Image->width*src3Image->height*4);
++          printf("[INFO] init resImg.\n");
++
++          resImgs->raise(resImg);
++
++          delete left3dResult;
++          delete right3dResult;
++          delete concatedImgData;
++          delete resizedImgData;
++          left3dResult = NULL;
++          right3dResult = NULL;
++          concatedImgData = NULL;
++          resizedImgData = NULL;
++        }
++        auto timeB = std::chrono::high_resolution_clock::now();
++        timeCostGet3DImg = timeB - timeA;
++        std::cout << "[INFO] timeCostGet3DImg: " << timeCostGet3DImg.count() << " ms\n";
++        lock.lock();
++      }
++    }
++  }
++
++  void print_current_time(std::string logLevel, std::string event) {
++    auto now = std::chrono::system_clock::now();
++    auto now_ms = std::chrono::time_point_cast<std::chrono::milliseconds>(now).time_since_epoch();
++    printf("[%s] %s : %ld\n", logLevel.c_str(), event.c_str(), now_ms.count());
++  }
++
+   void
+   encode_run(
+     int &frame_nr,  // Store progress of the frame number
+@@ -1845,6 +2062,9 @@ namespace video {
+       }
+     }
+ 
++    auto current = std::chrono::high_resolution_clock::now();
++    auto previous = std::chrono::high_resolution_clock::now();
++
+     while (true) {
+       if (shutdown_event->peek() || reinit_event.peek() || !images->running()) {
+         break;
+@@ -1872,8 +2092,10 @@ namespace video {
+       // Encode at a minimum FPS to avoid image quality issues with static content
+       if (!requested_idr_frame || images->peek()) {
+         if (auto img = images->pop(minimum_frame_time)) {
++          print_current_time("INFO", "images->pop");
+           frame_timestamp = img->frame_timestamp;
+           if (session->convert(*img)) {
++            print_current_time("INFO", "session->convert");
+             BOOST_LOG(error) << "Could not convert image"sv;
+             return;
+           }
+@@ -1886,6 +2108,12 @@ namespace video {
+       if (encode(frame_nr++, *session, packets, channel_data, frame_timestamp)) {
+         BOOST_LOG(error) << "Could not encode video packet"sv;
+         return;
++      } else {
++        print_current_time("INFO", "encode");
++        previous = current;
++        current = std::chrono::high_resolution_clock::now();
++        std::chrono::duration<double, std::milli> timePeriod = current - previous;
++        std::cout << "[INFO] encode gap:" << timePeriod.count() << "ms" << std::endl;
+       }
+ 
+       session->request_normal_frame();
+@@ -2270,6 +2498,25 @@ namespace video {
+       }
+       hdr_event->raise(std::move(hdr_info));
+ 
++#ifndef SUNSHINE_HARDWARD_ENCODE
++      auto depthImages = std::make_shared<img_event_t::element_type>();
++      auto src3Images = std::make_shared<img_event_t::element_type>();
++      auto resImgs = std::make_shared<img_event_t::element_type>();
++
++      std::thread getDepthThread(get_depth_img, std::ref(images),std::ref(depthImages), std::ref(src3Images), config);
++      getDepthThread.detach();
++
++      std::thread dibrThread(get_3D_img, std::ref(resImgs),std::ref(depthImages), std::ref(src3Images), config);
++      dibrThread.detach();
++
++      encode_run(
++        frame_nr,
++        mail, resImgs,
++        config, display,
++        std::move(encode_device),
++        ref->reinit_event, *ref->encoder_p,
++        channel_data);
++#else
+       encode_run(
+         frame_nr,
+         mail, images,
+@@ -2277,6 +2524,7 @@ namespace video {
+         std::move(encode_device),
+         ref->reinit_event, *ref->encoder_p,
+         channel_data);
++#endif        
+     }
+   }
+ 

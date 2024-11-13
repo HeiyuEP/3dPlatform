@@ -1,0 +1,25 @@
+diff --git a/cmake/targets/common.cmake b/cmake/targets/common.cmake
+index b086bdd..285636c 100644
+--- a/cmake/targets/common.cmake
++++ b/cmake/targets/common.cmake
+@@ -25,6 +25,20 @@ if(NOT DEFINED CMAKE_CUDA_STANDARD)
+     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+ endif()
+ 
++# depth & libtorch
++link_directories(
++    /home/zhike/3DPlatformDep/depth/lib
++)
++target_link_libraries(sunshine libdepth.so)
++
++link_directories(
++    /home/zhike/3DPlatformDep/openDibr/lib
++)
++target_link_libraries(sunshine libRealtimeDIBR3dPlatform.so)
++target_include_directories(sunshine
++    PUBLIC
++)
++
+ target_link_libraries(sunshine ${SUNSHINE_EXTERNAL_LIBRARIES} ${EXTRA_LIBS})
+ target_compile_definitions(sunshine PUBLIC ${SUNSHINE_DEFINITIONS})
+ set_target_properties(sunshine PROPERTIES CXX_STANDARD 20

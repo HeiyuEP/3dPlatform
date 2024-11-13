@@ -1,0 +1,30 @@
+diff --git a/cmake/compile_definitions/linux.cmake b/cmake/compile_definitions/linux.cmake
+index d90f5dc..6de5a60 100644
+--- a/cmake/compile_definitions/linux.cmake
++++ b/cmake/compile_definitions/linux.cmake
+@@ -80,6 +80,25 @@ if(CUDA_FOUND)
+     add_compile_definitions(SUNSHINE_BUILD_CUDA)
+ endif()
+ 
++# add opencv-dev
++find_package(OpenCV REQUIRED)
++list(APPEND PLATFORM_LIBRARIES ${OpenCV_LIBS})
++message(STATUS "OpenCV: ${OpenCV_LIBS}")
++
++#libtorch
++set(TORCH_ROOT "/home/zhike/3DPlatformDep/libtorch")
++include_directories(${TORCH_ROOT}/include)
++link_directories(${TORCH_ROOT}/lib)
++#depth
++include_directories(/home/zhike/3DPlatformDep/depth/include)
++link_directories(/home/zhike/3DPlatformDep/depth/lib)
++link_libraries(depth)
++
++link_directories(
++    /home/zhike/3DPlatformDep/openDibr/lib
++)
++link_libraries(RealtimeDIBR3dPlatform)
++
+ # drm
+ if(${SUNSHINE_ENABLE_DRM})
+     find_package(LIBDRM)

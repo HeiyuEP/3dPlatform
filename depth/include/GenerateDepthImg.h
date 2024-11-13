@@ -1,7 +1,6 @@
 #include <iostream>
 #include <vector>
 #include <opencv2/opencv.hpp>
-//#include <torch/torch.h>
 #include <torch/script.h>
 
 struct Img
@@ -27,9 +26,11 @@ private:
     int32_t MainProcess();
     int32_t PostProcess(uint8_t *outputData);
 
+    void getAlignSize();
+
     torch::jit::script::Module m_module;
     torch::DeviceType m_deviceType = torch::kCUDA;
-    int m_gpuID = 2;
+    int m_gpuID = 0;
 
     std::vector<torch::jit::IValue> m_inputs;
     torch::jit::IValue m_outputs_;
@@ -38,6 +39,4 @@ private:
     Img m_alignImg;
 
     Img m_srcImg;
-    //int32_t m_srcW;
-    //int32_t m_srcH;
 };

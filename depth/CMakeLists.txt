@@ -4,7 +4,7 @@ project(main)
 set(CMAKE_BUILD_TYPE "Debug")
 
 #libtorch
-#set(CMAKE_PREFIX_PATH /home/zhike/公共的/x30032372/libtorch)
+#set(CMAKE_PREFIX_PATH /home/zhike/libtorch)
 set(Torch_DIR /home/zhike/公共的/x30032372/libtorch/share/cmake/Torch)
 find_package(Torch REQUIRED)
 set(CMAKE_CXX_FLAGE "${CMAKE_CXX_FLAGE} ${TORCH_CXX_FLAGS}")
@@ -27,6 +27,7 @@ MESSAGE("LIBRARY_OUTPUT_PATH: ${LIBRARY_OUTPUT_PATH}")
 #生成动态库
 add_library(depth SHARED ${SRC})
 target_link_libraries(depth "${TORCH_LIBRARIES}")
+target_link_libraries(depth ${OpenCV_LIBRARIES})
 #包含动态库路径
 link_directories(${PROJECT_SOURCE_DIR}/lib)
 

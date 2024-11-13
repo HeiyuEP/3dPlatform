@@ -4,7 +4,7 @@
 # compile CXX with /usr/bin/c++
 CXX_DEFINES = -DUSE_C10D_GLOO -DUSE_C10D_NCCL -DUSE_DISTRIBUTED -DUSE_RPC -DUSE_TENSORPIPE -Ddepth_EXPORTS
 
-CXX_INCLUDES = -I/usr/include/opencv4 -I/home/zhike/公共的/x30032372/Depth-Anything-V2/cpp/pt/include -isystem /home/zhike/公共的/x30032372/libtorch/include -isystem /home/zhike/公共的/x30032372/libtorch/include/torch/csrc/api/include
+CXX_INCLUDES = -I/home/zhike/公共的/x30032372/Depth-Anything-V2/cpp/pt/include -isystem /usr/include/opencv4 -isystem /home/zhike/公共的/x30032372/libtorch/include -isystem /home/zhike/公共的/x30032372/libtorch/include/torch/csrc/api/include
 
 CXX_FLAGS = -g -fPIC -D_GLIBCXX_USE_CXX11_ABI=1
 

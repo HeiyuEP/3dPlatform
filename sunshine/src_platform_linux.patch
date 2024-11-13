@@ -1,0 +1,486 @@
+diff --git a/src/platform/linux/cuda.cpp b/src/platform/linux/cuda.cpp
+index 5498d9a..f3d3b1f 100644
+--- a/src/platform/linux/cuda.cpp
++++ b/src/platform/linux/cuda.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include <NvFBC.h>
+ #include <ffnvcodec/dynlink_loader.h>
++#include <opencv2/opencv.hpp>
+ 
+ extern "C" {
+ #include <libavcodec/avcodec.h>
+@@ -23,8 +24,18 @@ extern "C" {
+ #include "src/video.h"
+ #include "wayland.h"
+ 
++#include <iostream>
++#include <cstdlib>
++#include <string>
++#include <opencv2/opencv.hpp>
++#include <fstream>
++#include <chrono>
++#include <atomic>
++#include "GenerateDepthImg.h"
++
+ #define SUNSHINE_STRINGVIEW_HELPER(x) x##sv
+ #define SUNSHINE_STRINGVIEW(x) SUNSHINE_STRINGVIEW_HELPER(x)
++#define SUNSHINE_HARDWARD_ENCODE
+ 
+ #define CU_CHECK(x, y) \
+   if (check((x), SUNSHINE_STRINGVIEW(y ": "))) return -1
+@@ -34,6 +45,12 @@ extern "C" {
+ 
+ namespace fs = std::filesystem;
+ 
++#ifdef SUNSHINE_HARDWARD_ENCODE
++  extern int DIBRFlagTest(uint8_t* colorData, uint8_t* depthData, uint8_t** resultImg, bool outputLeft, uint8_t flag);
++  extern int MAX_CAPTURE_FRAME_COUNT;
++  static int depthToDibrCount = 0;
++#endif
++
+ using namespace std::literals;
+ namespace cuda {
+   constexpr auto cudaDevAttrMaxThreadsPerBlock = (CUdevice_attribute) 1;
+@@ -82,10 +99,29 @@ namespace cuda {
+   using registered_resource_t = util::safe_ptr<CUgraphicsResource_st, unregisterResource>;
+ 
+   class img_t: public platf::img_t {
+-  public:
+-    tex_t tex;
++    public:
++      ~img_t() override {
++        delete[] data;
++        data = nullptr;
++      }
++      tex_t tex;
++  };
++
++#ifdef SUNSHINE_HARDWARD_ENCODE
++  struct queueData {
++    img_t* imgT;
++    uint8_t* data;
++    std::chrono::time_point<std::chrono::_V2::system_clock, std::chrono::duration<long int, std::ratio<1, 1000000000> > > timestamp;
+   };
+ 
++  std::queue<queueData> srcImages;
++  std::queue<queueData> depthImages;
++  std::queue<queueData> src3Images;
++  std::mutex mtxA, mtxB;
++  std::condition_variable cvA, cvB;
++  std::atomic<bool> running(true); // 线程运行标志
++#endif
++
+   int
+   init() {
+     auto status = cuda_load_functions(&cdf, nullptr);
+@@ -788,6 +824,12 @@ namespace cuda {
+         return 0;
+       }
+ 
++      void clearQueue(std::queue<queueData> &queue) {
++        while (!queue.empty()) {
++          queue.pop();
++        }
++      }
++
+       platf::capture_e
+       capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) override {
+         auto next_frame = std::chrono::steady_clock::now();
+@@ -809,7 +851,17 @@ namespace cuda {
+ 
+         sleep_overshoot_logger.reset();
+ 
++#ifdef SUNSHINE_HARDWARD_ENCODE
++        printf("[INFO] starting threads...\n");
++        std::thread getDepthThread(get_depth_img);
++        getDepthThread.detach();
++
++        std::thread dibrThread(get_3D_img);
++        dibrThread.detach();
++#endif
++
+         while (true) {
++          print_current_time("INFO", "pre-snapshot.");
+           auto now = std::chrono::steady_clock::now();
+           if (next_frame > now) {
+             std::this_thread::sleep_for(next_frame - now);
+@@ -821,6 +873,7 @@ namespace cuda {
+           if (next_frame < now) {  // some major slowdown happened; we couldn't keep up
+             next_frame = now + delay;
+           }
++          print_current_time("INFO", "ready to snap shot.");
+ 
+           std::shared_ptr<platf::img_t> img_out;
+           auto status = snapshot(pull_free_image_cb, img_out, 150ms, *cursor);
+@@ -838,13 +891,22 @@ namespace cuda {
+               if (!push_captured_image_cb(std::move(img_out), true)) {
+                 return platf::capture_e::ok;
+               }
++              print_current_time("INFO", "case platf::capture_e::ok");
+               break;
+             default:
+               BOOST_LOG(error) << "Unrecognized capture status ["sv << (int) status << ']';
+               return status;
+           }
+         }
+-
++#ifdef SUNSHINE_HARDWARD_ENCODE
++        clearQueue(srcImages);
++        clearQueue(depthImages);
++        clearQueue(src3Images); 
++        printf("clearQueue...\n");
++        
++        running =false;
++        cvA.notify_all();
++#endif
+         return platf::capture_e::ok;
+       }
+ 
+@@ -920,7 +982,12 @@ namespace cuda {
+       }
+ 
+       platf::capture_e
+-      snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor) {
++      snapshot(
++        const pull_free_image_cb_t &pull_free_image_cb, 
++        std::shared_ptr<platf::img_t> &img_out, 
++        std::chrono::milliseconds timeout, 
++        bool cursor) {
++        print_current_time("INFO", "-----snapshot-----");
+         if (cursor != cursor_visible) {
+           auto status = reinit(cursor);
+           if (status != platf::capture_e::ok) {
+@@ -953,10 +1020,39 @@ namespace cuda {
+         }
+         auto img = (img_t *) img_out.get();
+ 
++#ifdef SUNSHINE_HARDWARD_ENCODE
++        uint32_t frameSize = img->height * img->width * img->pixel_pitch;
++        uint8_t* srcImage = new uint8_t[frameSize];
++
++        auto timeA = std::chrono::high_resolution_clock::now();
++        img->tex.copyToHost((std::uint8_t *) device_ptr, srcImage, frameSize);
++        print_current_time("INFO", "img->tex.copyToHost");
++        auto timeB = std::chrono::high_resolution_clock::now();
++        std::chrono::duration<double, std::milli> timePeriod1 = timeB - timeA;
++        std::cout << "[INFO] copyToHost:" << timePeriod1.count() << "ms" << std::endl;
++        
++        queueData srcImageQD;
++        srcImageQD.imgT = img;
++        srcImageQD.data = srcImage;
++        srcImageQD.timestamp = timeA;
++
++        {
++          std::lock_guard<std::mutex> lock(mtxA);
++          print_current_time("INFO", "mtxA.");
++          if (srcImages.size() >= MAX_CAPTURE_FRAME_COUNT) {
++            printf("[INFO] srcImages.pop, size:%ld\n", srcImages.size());
++            print_current_time("INFO", "srcImages.pop, size");            
++            delete srcImages.front().data;
++            srcImages.pop();
++          }
++          srcImages.push(srcImageQD);
++        }
++        cvA.notify_one();
++#else
+         if (img->tex.copy((std::uint8_t *) device_ptr, img->height, img->row_pitch)) {
+           return platf::capture_e::error;
+         }
+-
++#endif
+         return platf::capture_e::ok;
+       }
+ 
+@@ -969,11 +1065,11 @@ namespace cuda {
+       alloc_img() override {
+         auto img = std::make_shared<cuda::img_t>();
+ 
+-        img->data = nullptr;
+         img->width = width;
+         img->height = height;
+         img->pixel_pitch = 4;
+         img->row_pitch = img->width * img->pixel_pitch;
++        img->data = new std::uint8_t[height * img->row_pitch];
+ 
+         auto tex_opt = tex_t::make(height, width * img->pixel_pitch);
+         if (!tex_opt) {
+@@ -990,6 +1086,237 @@ namespace cuda {
+         return 0;
+       }
+ 
++#ifdef SUNSHINE_HARDWARD_ENCODE
++      static void get_depth_img() {
++        printf("[INFO] get_depth_img thread.\n");
++        int w = 1920;
++        int h = 1080;
++        GenerateDepthImg* depth = new GenerateDepthImg(w,h,4);
++        size_t srcSize = w*h*4;
++        std::uint8_t *srcData = new uint8_t[srcSize];
++        size_t src3Size = w*h*3;
++        std::uint8_t *src3Data = new uint8_t[src3Size];
++        size_t depthSize = w*h;
++        std::uint8_t *depthData = new uint8_t[depthSize];
++
++        std::chrono::duration<double, std::milli> timeCostGetDepthImg;
++        
++        int doDepthV2 = false;
++
++        while (running || !srcImages.empty()) {
++          auto timeA = std::chrono::high_resolution_clock::now();
++          queueData srcImageQD;
++          if (!srcImages.empty()) {
++            printf("[INFO] srcImages.size():%ld\n", srcImages.size());
++          }
++          
++          {
++            std::unique_lock<std::mutex> lock(mtxA);
++            cvA.wait(lock, [] { return !srcImages.empty() || !running; });
++            if (!srcImages.empty()) {
++              srcImageQD = srcImages.front();
++              srcImages.pop();
++            } else {
++              continue;
++            }
++          }
++
++          uint8_t* depthImage = new uint8_t[depthSize];
++          uint8_t* src3Image = new uint8_t[src3Size];
++
++          if (srcImageQD.data != NULL) {
++            memcpy(srcData, srcImageQD.data, srcSize);
++            delete srcImageQD.data;
++          }
++          depth->Execute(srcData, src3Data, depthData);
++
++          memcpy(depthImage, depthData, depthSize);
++          memcpy(src3Image, src3Data, src3Size);
++          queueData depthImageQD;
++          depthImageQD.imgT = srcImageQD.imgT;
++          depthImageQD.data = depthImage;
++          depthImageQD.timestamp = srcImageQD.timestamp;
++
++
++          queueData src3ImageQD;
++          src3ImageQD.imgT = srcImageQD.imgT;
++          src3ImageQD.data = src3Image;
++          src3ImageQD.timestamp = srcImageQD.timestamp;
++
++          std::cout << "[INFO] get_depth_img:Ready for Raise." << std::endl;
++
++          {
++            std::lock_guard<std::mutex> lock(mtxB);
++            if (depthImages.size() >= MAX_CAPTURE_FRAME_COUNT) {
++              delete depthImages.front().data;
++              depthImages.pop();
++            }
++            if (src3Images.size() >= MAX_CAPTURE_FRAME_COUNT) {
++              delete src3Images.front().data;
++              src3Images.pop();
++            }
++
++            depthImages.push(depthImageQD);
++            src3Images.push(src3ImageQD);
++          }
++          cvB.notify_one();
++          
++          depthToDibrCount++;
++          printf("[INFO] get_depth_img: depth -> DibrCount = %d\n", depthToDibrCount);
++          std::cout << "[INFO] get_depth_img:Raise completed." << std::endl;
++          doDepthV2 = true;
++
++          auto timeB = std::chrono::high_resolution_clock::now();
++          if (doDepthV2) {
++            timeCostGetDepthImg = timeB - timeA;
++            printf("[INFO] timeCostGetDepthImg: %f ms\n", timeCostGetDepthImg.count());
++          }
++          doDepthV2 = false;
++        }
++
++        if (depthData != NULL) {
++            delete depthData;
++            depthData = NULL;
++        }
++        if (srcData != NULL) {
++            delete srcData;
++            srcData = NULL;
++        }
++        if (src3Data != NULL) {
++            delete src3Data;
++            src3Data = NULL;
++        }
++        delete depth;
++      }
++
++      static void get_3D_img() {
++        printf("[INFO] get_3D_img thread.\n");
++        int leftInitRet = DIBRFlagTest(nullptr, nullptr,nullptr,1,0);
++        int rightInitRet = DIBRFlagTest(nullptr, nullptr,nullptr,0,0);
++        if (leftInitRet || rightInitRet) {
++          printf("[ERROR] leftInitRet is %d,  rightInitRet is %d.\n", leftInitRet, rightInitRet);
++          return;
++        }
++
++        std::chrono::duration<double, std::milli> timeCostGet3DImg;
++        std::chrono::duration<double, std::milli> timeCostDibr;
++        std::chrono::duration<double, std::milli> timeCostWholePipeline;
++
++        int src3ImageWidth = 1920;
++        int src3ImageHeight = 1080;
++
++        while (running || !depthImages.empty()) {
++          queueData depthImageQD;
++          queueData src3ImageQD;
++          auto timeA = std::chrono::high_resolution_clock::now();
++          
++          {
++            std::unique_lock<std::mutex> lock(mtxB);
++            cvB.wait(lock, [] { return !depthImages.empty() || !running; });
++            if (!depthImages.empty()) {
++              timeA = std::chrono::high_resolution_clock::now();
++              depthImageQD = depthImages.front();
++              depthImages.pop();
++              src3ImageQD = src3Images.front();
++              src3Images.pop();
++              printf("[INFO] get_3D_img:depthToDibrCount=%d\n", depthToDibrCount);
++            } else {
++              continue;
++            }
++          }
++
++          depthToDibrCount--;
++          auto timeB = std::chrono::high_resolution_clock::now();
++
++          uint8_t* left3dResult = NULL;
++          int retLeft = DIBRFlagTest(src3ImageQD.data, depthImageQD.data, &left3dResult, 1, 1);
++          uint8_t* right3dResult = NULL;
++          int retRight = DIBRFlagTest(src3ImageQD.data, depthImageQD.data, &right3dResult, 0, 1);
++          auto timeC = std::chrono::high_resolution_clock::now();
++
++          printf("[INFO] retLeft:%d, retRight:%d\n", retLeft, retRight);
++          delete src3ImageQD.data;
++          delete depthImageQD.data;
++
++          if (retLeft == 0 && retRight == 0 && left3dResult != NULL && right3dResult != NULL) {
++            uint8_t* concatedImgData = nullptr;
++            concatenate_filp_images(left3dResult, right3dResult, src3ImageWidth, src3ImageHeight, 4, &concatedImgData);
++            printf("[INFO] concatenate_filp_images\n");
++
++            uint8_t* resizedImgData = nullptr;
++            resize_image(concatedImgData, src3ImageWidth*2, src3ImageHeight, 4, &resizedImgData, src3ImageWidth);
++            printf("[INFO] resize_image\n");
++
++            uint8_t* resImg = new uint8_t[src3ImageWidth*src3ImageHeight*4];
++
++            memcpy(resImg, resizedImgData, src3ImageWidth*src3ImageHeight*4);
++            printf("[INFO] memcpy resImg.\n");
++
++            auto img = depthImageQD.imgT;
++            img->tex.copyToDevice(resImg, img->height, img->row_pitch);
++            
++            delete resImg;
++            delete left3dResult;
++            delete right3dResult;
++            delete concatedImgData;
++            delete resizedImgData;
++            left3dResult = NULL;
++            right3dResult = NULL;
++            concatedImgData = NULL;
++            resizedImgData = NULL;
++          }
++          auto srcTimeStamp = src3ImageQD.timestamp;
++          auto timeD = std::chrono::high_resolution_clock::now();
++          timeCostWholePipeline = timeD - srcTimeStamp;
++          timeCostGet3DImg = timeD - timeA;
++          timeCostDibr = timeC - timeB;
++          printf("[INFO] timeCostGet3DImg: %f ms\n", timeCostGet3DImg.count());
++          printf("[INFO] timeCostDibr: %f ms\n", timeCostDibr.count());
++          printf("[INFO] timeCostWholePipeline: %f ms\n", timeCostWholePipeline.count());
++        }
++      }
++
++      static void concatenate_filp_images(uint8_t* data1, uint8_t* data2, int width, int height, int channels, uint8_t** new_data) {
++        int new_width = width * 2;
++        *new_data = new uint8_t[new_width*height*channels];
++        for (int y=0;y<height;++y) {
++          int src_y = height - 1 - y;
++          uint8_t* row1 = data1 + (src_y*width*channels);
++          uint8_t* row2 = data2 + (src_y*width*channels);
++
++          uint8_t* new_row = *new_data + (y*new_width*channels);
++          memcpy(new_row, row1, width*channels); // 左半部分
++          memcpy(new_row+(width*channels),row2,width*channels); // 右半部分
++        }
++      }
++
++      static void resize_image(uint8_t* input_data, int input_width, int input_height, int channels, uint8_t** output_data, int output_width) {
++        *output_data = new uint8_t[output_width*input_height*channels];
++
++        float scale = static_cast<float>(input_width) / output_width;
++
++        for (int y=0; y<input_height ; ++y) {
++          for (int x=0;x<output_width;++x) {
++            int src_x = static_cast<int>(x*scale);
++            src_x = std::min(src_x, input_width-1);
++            uint8_t* src_pixel = input_data + (y*input_width*channels)+(src_x*channels);
++            uint8_t* dest_pixel = (*output_data) + (y*output_width*channels)+(x*channels);
++            for (int c=0; c<channels;++c) {
++              dest_pixel[c] = src_pixel[c];
++            }
++          }
++        }
++      }
++
++      static void print_current_time(std::string logLevel, std::string event) {
++        auto now = std::chrono::system_clock::now();
++        auto now_ms = std::chrono::time_point_cast<std::chrono::milliseconds>(now).time_since_epoch();
++        printf("[%s] %s : %ld\n", logLevel.c_str(), event.c_str(), now_ms.count());
++      }
++
++
++#endif      
++
+       std::chrono::nanoseconds delay;
+ 
+       bool cursor_visible;
+diff --git a/src/platform/linux/cuda.cu b/src/platform/linux/cuda.cu
+index 7456dd4..189c894 100644
+--- a/src/platform/linux/cuda.cu
++++ b/src/platform/linux/cuda.cu
+@@ -189,9 +189,18 @@ __global__ void RGBA_to_NV12(
+   dstY1[1]  = calcY(rgb_rb, color_matrix) * 245.0f; // 245.0f is a magic number to ensure slight changes in luminosity are more visible
+ }
+ 
++int tex_t::copyToHost(std::uint8_t *src, std::uint8_t *dst, int size) {
++  CU_CHECK(cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost), "Couldn't copy to hostdata from deviceptr");
++  return 0;
++}
++
++int tex_t::copyToDevice(std::uint8_t *src, int height, int pitch) {
++  CU_CHECK(cudaMemcpy2DToArray(array, 0, 0, src, pitch, pitch, height, cudaMemcpyHostToDevice), "Couldn't copy to deviceptr from hostdata");
++  return 0;
++}
++
+ int tex_t::copy(std::uint8_t *src, int height, int pitch) {
+   CU_CHECK(cudaMemcpy2DToArray(array, 0, 0, src, pitch, pitch, height, cudaMemcpyDeviceToDevice), "Couldn't copy to cuda array from deviceptr");
+-
+   return 0;
+ }
+ 
+diff --git a/src/platform/linux/cuda.h b/src/platform/linux/cuda.h
+index 88b684b..eb90fa3 100644
+--- a/src/platform/linux/cuda.h
++++ b/src/platform/linux/cuda.h
+@@ -94,6 +94,12 @@ namespace cuda {
+     int
+     copy(std::uint8_t *src, int height, int pitch);
+ 
++    int
++    copyToHost(std::uint8_t *src, std::uint8_t *dst, int size);
++
++    int
++    copyToDevice(std::uint8_t *src, int height, int pitch);
++
+     cudaArray_t array;
+ 
+     struct texture {

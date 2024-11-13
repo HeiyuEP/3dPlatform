@@ -1,0 +1,704 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 69a7b3a..89f70cd 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,6 +1,6 @@
+ cmake_minimum_required(VERSION 3.7)
+ 
+-project(RealtimeDIBR)
++project(RealtimeDIBR3dPlatform)
+ 
+ # Set C++11 for all projects and disable non-standard extensions
+ set(CMAKE_CXX_STANDARD 11)
+@@ -186,8 +186,7 @@ if(MSVC)
+     add_definitions(-D_CRT_SECURE_NO_WARNINGS)
+ endif()
+ 
+-
+-cuda_add_executable(${PROJECT_NAME}  ${APP_SOURCES} ${APP_HEADERS} ${NV_DEC_HDRS} ${APP_RESOURCES})
++cuda_add_library(${PROJECT_NAME} SHARED ${APP_SOURCES} ${APP_HEADERS} ${NV_DEC_HDRS} ${APP_RESOURCES})
+ 
+ set_target_properties(${PROJECT_NAME} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+ 
+diff --git a/src/Application.h b/src/Application.h
+index cb2f57e..3035f8c 100644
+--- a/src/Application.h
++++ b/src/Application.h
+@@ -17,6 +17,7 @@
+ #include <stdio.h>
+ #include <string>
+ #include <cstdlib>
++#include <chrono>
+ #include <vector>
+ #include <iostream>
+ #include <algorithm>
+@@ -55,10 +56,13 @@ class Application
+ public:
+ 	Application(Options options, FpsMonitor* fpsMonitor, std::vector<InputCamera> inputCameras, std::vector<OutputCamera> outputCameras);
+ 
+-	virtual bool BInit();
+-	virtual bool BInitGL();
+-
++	virtual bool BInit(uint8_t* colorData, uint8_t* depthData);
++	virtual bool BInitGL(uint8_t* colorData, uint8_t* depthData);
++	virtual bool BInitGLPre3dPlatform();
++	virtual bool BInitGLTexture3dPlatform(uint8_t* colorData, uint8_t* depthData);
++	
+ 	virtual void Shutdown();
++	virtual void Shutdown3dPlatform();
+ 
+ 	void RunMainLoop();
+ 	virtual bool HandleUserInput();
+@@ -68,7 +72,7 @@ public:
+ 	virtual bool SetupStereoRenderTargets();
+ 	virtual void SetupCompanionWindow();
+ 	void SetupYUV420Textures(int texture_height, int luma_height);
+-	bool SetupRGBTextures();
++	bool SetupRGBTextures(uint8_t* colorData, uint8_t* depthData);
+ 	void SetupCUgraphicsResources();
+ 	bool SetupDecodingPool();
+ 
+@@ -78,6 +82,9 @@ public:
+ 
+ 	bool CreateAllShaders(float chroma_offset);
+ 	void SaveCompanionWindowToYUV(int frameNr, std::string filename, bool saveAsPNG = false);
++	uint8_t* GetResultImg() {
++		return result_img;
++	}
+ 
+ protected:
+ 
+@@ -93,6 +100,8 @@ protected:
+ 	unsigned int m_uiCompanionWindowIndexSize;
+ 	unsigned int m_uiControllerVertcount;
+ 
++	uint8_t* result_img = NULL;
++
+ 	struct VertexDataWindow
+ 	{
+ 		glm::vec2 position;
+@@ -154,8 +163,10 @@ Application::Application(Options options, FpsMonitor* fpsMonitor, std::vector<In
+ 	cuContext = new CUcontext();
+ };
+ 
+-bool Application::BInit()
++bool Application::BInit(uint8_t* colorData, uint8_t* depthData)
+ {
++	auto timeA = std::chrono::high_resolution_clock::now();
++
+ 	if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) < 0)
+ 	{
+ 		printf("%s - SDL could not initialize! SDL Error: %s\n", __FUNCTION__, SDL_GetError());
+@@ -164,7 +175,7 @@ bool Application::BInit()
+ 
+ 	int nWindowPosX = 20;
+ 	int nWindowPosY = 20;
+-	Uint32 unWindowFlags = SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN;
++	Uint32 unWindowFlags = SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN;
+ 
+ 	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
+ 	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+@@ -205,17 +216,27 @@ bool Application::BInit()
+ 
+ 	std::string strWindowTitle = "OpenDIBR";
+ 	SDL_SetWindowTitle(m_pCompanionWindow, strWindowTitle.c_str());
++	auto timeB = std::chrono::high_resolution_clock::now();
+ 
+-	if (!BInitGL())
++	if (!BInitGL(colorData, depthData))
+ 	{
+ 		printf("%s - Unable to initialize OpenGL!\n", __FUNCTION__);
+ 		return false;
+ 	}
++
++	auto timeC = std::chrono::high_resolution_clock::now();
++	std::chrono::duration<double, std::milli> elapsed1 = timeB - timeA;
++    std::chrono::duration<double, std::milli> elapsed2 = timeC - timeB;
++	std::cout << "[INFO] DIBR: Binit time: " << elapsed1.count() << " ms\n";
++	std::cout << "[INFO] DIBR: BInitGL time: " << elapsed2.count() << " ms\n";
++
+ 	return true;
+ }
+ 
+-bool Application::BInitGL()
++
++bool Application::BInitGL(uint8_t* colorData, uint8_t* depthData)
+ {
++	auto timeA = std::chrono::high_resolution_clock::now();
+ 	// the chroma data is stored "chroma_offset" rows below the luma data
+ 	int luma_height = inputCameras[0].res_y;
+ 	int luma_height_rounded = ((luma_height + 16 - 1) / 16) * 16; //round luma height up to multiple of 16
+@@ -225,9 +246,10 @@ bool Application::BInitGL()
+ 	SetupStereoRenderTargets();
+ 	if (!CreateAllShaders(chroma_offset))
+ 		return false;
++	auto timeB = std::chrono::high_resolution_clock::now();
+ 
+ 	if (options.usePNGs) {
+-		if (!SetupRGBTextures()) {
++		if (!SetupRGBTextures(colorData, depthData)) {
+ 			return false;
+ 		}
+ 	}
+@@ -241,6 +263,58 @@ bool Application::BInitGL()
+ 			return false;
+ 		}
+ 	}
++
++	auto timeC = std::chrono::high_resolution_clock::now();
++	std::chrono::duration<double, std::milli> elapsed1 = timeB - timeA;
++    std::chrono::duration<double, std::milli> elapsed2 = timeC - timeB;
++	std::cout << "[INFO] DIBR: BInitGL->SetupStereoRenderTargets time: " << elapsed1.count() << " ms\n";
++	std::cout << "[INFO] DIBR: BInitGL->SetupRGBTextures time: " << elapsed2.count() << " ms\n";
++
++	return true;
++}
++
++bool Application::BInitGLPre3dPlatform()
++{
++	printf("[INFO] DIBR: Application::BInitGLPre3dPlatform.\n");
++	int luma_height = inputCameras[0].res_y;
++
++	int luma_height_rounded = ((luma_height + 16 - 1) / 16) * 16; //round luma height up to multiple of 16
++	int texture_height = luma_height_rounded + /*chroma height */luma_height / 2;
++	float chroma_offset = float(luma_height_rounded - luma_height);
++	SetupCameras(); // needs to go first
++	SetupStereoRenderTargets();
++	if (!CreateAllShaders(1.0))
++		return false;
++
++	textures_color = new GLuint[inputCameras.size()];
++	textures_depth = new GLuint[inputCameras.size()];
++	glGenTextures((GLsizei)inputCameras.size(), textures_color);
++	glGenTextures((GLsizei)inputCameras.size(), textures_depth);
++
++	glGenVertexArrays(1, &m_unCompanionWindowVAO);
++	glGenBuffers(1, &m_glCompanionWindowIDVertBuffer);
++	glGenBuffers(1, &m_glCompanionWindowIDIndexBuffer);
++
++	return true;
++}
++
++bool Application::BInitGLTexture3dPlatform(uint8_t* colorData, uint8_t* depthData)
++{
++	auto timeA = std::chrono::high_resolution_clock::now();
++	if (options.usePNGs) {
++		if (!SetupRGBTextures(colorData, depthData)) {
++			return false;
++		}
++	}
++	auto timeB = std::chrono::high_resolution_clock::now();
++
++	SetupCompanionWindow();
++
++	auto timeC = std::chrono::high_resolution_clock::now();
++	std::chrono::duration<double, std::milli> elapsed1 = timeB - timeA;
++    std::chrono::duration<double, std::milli> elapsed2 = timeC - timeB;
++	std::cout << "[INFO] DIBR: SetupRGBTextures time: " << elapsed1.count() << " ms\n";
++	std::cout << "[INFO] DIBR: SetupCompanionWindow time: " << elapsed2.count() << " ms\n";
+ 	return true;
+ }
+ 
+@@ -303,6 +377,56 @@ void Application::Shutdown()
+ 	SDL_Quit();
+ }
+ 
++void Application::Shutdown3dPlatform()
++{
++	if (m_pContext)
++	{
++		printf("-----m_pContext-----\n");
++
++		if (m_unCompanionWindowVAO != 0)
++		{
++			glDeleteVertexArrays(1, &m_unCompanionWindowVAO);
++			glDeleteBuffers(1, &m_glCompanionWindowIDVertBuffer);
++			glDeleteBuffers(1, &m_glCompanionWindowIDIndexBuffer);
++		}
++	}
++
++	if (!options.isStatic) {
++		pool.cleanup();
++	}
++
++	if (!options.usePNGs) {
++		for (auto& glGraphicsResource : glGraphicsResources) {
++			ck(cuGraphicsUnregisterResource(*glGraphicsResource));
++			delete glGraphicsResource;
++		}
++		glGraphicsResources.clear();
++		for (auto& demuxer : demuxers) {
++			delete demuxer;
++		}
++		demuxers.clear();
++		for (auto& decoder : decoders) {
++			delete decoder;
++		}
++		decoders.clear();
++
++		// do this after decoders are cleared
++		if (cuContext) {
++			ck(cuCtxDestroy(*cuContext));
++			delete cuContext;
++		}
++	}
++
++	if (textures_color != NULL) {
++		glDeleteTextures((GLsizei)inputCameras.size(), textures_color);
++		delete[] textures_color;
++	}
++	if (textures_depth != NULL) {
++		glDeleteTextures((GLsizei)inputCameras.size(), textures_depth);
++		delete[] textures_depth;
++	}
++}
++
+ bool Application::HandleUserInput()
+ {
+ 	return false;
+@@ -385,8 +509,14 @@ void Application::RunMainLoop()
+ 
+ bool Application::RenderFrame(bool nextVideoFrame, std::string outputCameraName, int frameNr)
+ {
++	auto timeA = std::chrono::high_resolution_clock::now();
+ 	RenderTarget(nextVideoFrame);
++    auto timeB = std::chrono::high_resolution_clock::now();
++    std::chrono::duration<double, std::milli> elapsed1 = timeB - timeA;
++	std::cout << "[INFO] DIBR: RenderTarget time: " << elapsed1.count() << " ms\n";
++
+ 	if (outputCameraName != "") {
++		// 进入分支获取image图像
+ 		SaveCompanionWindowToYUV(frameNr, outputCameraName);
+ 	}
+ 	
+@@ -446,14 +576,11 @@ void Application::SetupCompanionWindow()
+ 	GLushort vIndices[] = { 0, 1, 3,   0, 3, 2 };
+ 	m_uiCompanionWindowIndexSize = _countof(vIndices);
+ 
+-	glGenVertexArrays(1, &m_unCompanionWindowVAO);
+ 	glBindVertexArray(m_unCompanionWindowVAO);
+ 
+-	glGenBuffers(1, &m_glCompanionWindowIDVertBuffer);
+ 	glBindBuffer(GL_ARRAY_BUFFER, m_glCompanionWindowIDVertBuffer);
+ 	glBufferData(GL_ARRAY_BUFFER, vVerts.size() * sizeof(VertexDataWindow), &vVerts[0], GL_STATIC_DRAW);
+ 
+-	glGenBuffers(1, &m_glCompanionWindowIDIndexBuffer);
+ 	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_glCompanionWindowIDIndexBuffer);
+ 	glBufferData(GL_ELEMENT_ARRAY_BUFFER, m_uiCompanionWindowIndexSize * sizeof(GLushort), &vIndices[0], GL_STATIC_DRAW);
+ 
+@@ -512,12 +639,7 @@ void Application::SetupYUV420Textures(int texture_height, int luma_height) {
+ 	}
+ }
+ 
+-bool Application::SetupRGBTextures() {
+-	textures_color = new GLuint[inputCameras.size()];
+-	textures_depth = new GLuint[inputCameras.size()];
+-	glGenTextures((GLsizei)inputCameras.size(), textures_color);
+-	glGenTextures((GLsizei)inputCameras.size(), textures_depth);
+-
++bool Application::SetupRGBTextures(uint8_t* colorData, uint8_t* depthData) {
+ 	int width, height, nrChannels;
+ 	for (int i = 0; i < inputCameras.size(); i++) {
+ 		// technically only need #threads * 2 textures
+@@ -537,13 +659,12 @@ bool Application::SetupRGBTextures() {
+ 			stbi_image_free(data);
+ 		}
+ 		else {
+-			unsigned char* data = stbi_load(inputCameras[i].pathColor.c_str(), &width, &height, &nrChannels, STBI_rgb);
++			unsigned char* data = colorData;
+ 			if (!data) {
+ 				std::cout << "Error: failed to load texture " << inputCameras[i].pathColor << std::endl;
+ 				return false;
+ 			}
+ 			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, inputCameras[0].res_x, inputCameras[0].res_y, 0, GL_RGB, GL_UNSIGNED_BYTE, data);
+-			stbi_image_free(data);
+ 		}
+ 
+ 		glBindTexture(GL_TEXTURE_2D, textures_depth[i]);
+@@ -551,6 +672,7 @@ bool Application::SetupRGBTextures() {
+ 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+ 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+ 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++
+ 		if (inputCameras[i].bitdepth_depth > 8) {
+ 			unsigned short* data = stbi_load_16(inputCameras[i].pathDepth.c_str(), &width, &height, &nrChannels, STBI_grey);
+ 			if (!data) {
+@@ -561,13 +683,12 @@ bool Application::SetupRGBTextures() {
+ 			stbi_image_free(data);
+ 		}
+ 		else {
+-			unsigned char* data = stbi_load(inputCameras[i].pathDepth.c_str(), &width, &height, &nrChannels, STBI_grey);
++			unsigned char* data = depthData;
+ 			if (!data) {
+ 				std::cout << "Error: failed to load texture " << inputCameras[i].pathDepth << std::endl;
+ 				return false;
+ 			}
+ 			glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, inputCameras[0].res_x, inputCameras[0].res_y, 0, GL_RED, GL_UNSIGNED_BYTE, data);
+-			stbi_image_free(data);
+ 		}
+ 	}
+ 	return true;
+@@ -761,13 +882,7 @@ void Application::SaveCompanionWindowToYUV(int frameNr, std::string outputCamera
+ 	unsigned char* image = new unsigned char[options.SCR_WIDTH * options.SCR_HEIGHT * 4];
+ 	framebuffers.bindCurrentBuffer();
+ 	glReadPixels(0, 0, options.SCR_WIDTH, options.SCR_HEIGHT, GL_RGBA, GL_UNSIGNED_BYTE, image);
+-	if (saveAsPNG || options.usePNGs) {
+-		saveImage(image, options.SCR_WIDTH, options.SCR_HEIGHT, true, frameNr, options.outputPath + outputCameraName + ".png");
+-	}
+-	else {
+-		saveImage(image, options.SCR_WIDTH, options.SCR_HEIGHT, false, frameNr, options.outputPath + outputCameraName + ".yuv");
+-	}
+-	delete[] image;
++	result_img = image;
+ 	return;
+ }
+ 
+diff --git a/src/PCApplication.h b/src/PCApplication.h
+index 08c7884..b3de837 100644
+--- a/src/PCApplication.h
++++ b/src/PCApplication.h
+@@ -9,8 +9,12 @@ class PCApplication : public Application
+ public:
+ 	PCApplication(Options options, FpsMonitor* fpsMonitor, std::vector<InputCamera> inputCameras, std::vector<OutputCamera> outputCameras);
+ 
+-	bool BInitGL();
++	bool BInitGL(uint8_t* colorData, uint8_t* depthData);
+ 	bool HandleUserInput();
++	bool BInitGLTotal3dPlatform(uint8_t* colorData, uint8_t* depthData);
++	bool BInit3dPlatform();
++	bool BInitGLPre3dPlatform();
++	bool BInitGLFramebuffers3dPlatform();
+ 
+ 	// keep track of user input
+ 	glm::vec3 accumMovement = glm::vec3();
+@@ -20,12 +24,101 @@ public:
+ PCApplication::PCApplication(Options options, FpsMonitor* fpsMonitor, std::vector<InputCamera> inputCameras, std::vector<OutputCamera> outputCameras)
+ 	: Application(options, fpsMonitor, inputCameras, outputCameras){};
+ 
++bool PCApplication::BInit3dPlatform()
++{
++	if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) < 0)
++	{
++		printf("%s - SDL could not initialize! SDL Error: %s\n", __FUNCTION__, SDL_GetError());
++		return false;
++	}
++
++	int nWindowPosX = 20;
++	int nWindowPosY = 20;
++	Uint32 unWindowFlags = SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN;
++
++	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
++	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
++	SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
++
++	SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, 0);
++	SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES, 0);
++
++	m_pCompanionWindow = SDL_CreateWindow("OpenDIBR", nWindowPosX, nWindowPosY, options.SCR_WIDTH, options.SCR_HEIGHT, unWindowFlags);
++	if (m_pCompanionWindow == NULL)
++	{
++		printf("%s - Window could not be created! SDL Error: %s\n", __FUNCTION__, SDL_GetError());
++		return false;
++	}
++
++	m_pContext = SDL_GL_CreateContext(m_pCompanionWindow);
++	if (m_pContext == NULL)
++	{
++		printf("%s - OpenGL context could not be created! SDL Error: %s\n", __FUNCTION__, SDL_GetError());
++		return false;
++	}
++
++	glewExperimental = GL_TRUE;
++	GLenum nGlewError = glewInit();
++	if (nGlewError != GLEW_OK)
++	{
++		printf("%s - Error initializing GLEW! %s\n", __FUNCTION__, glewGetErrorString(nGlewError));
++		return false;
++	}
++	glGetError(); // to clear the error caused deep in GLEW
++
++	if (SDL_GL_SetSwapInterval(0) < 0) // 0 means vsync off, 1 means vsync on
++	{
++		printf("%s - Warning: Unable to set VSync! SDL Error: %s\n", __FUNCTION__, SDL_GetError());
++		return false;
++	}
++
++	std::string strWindowTitle = "OpenDIBR";
++	SDL_SetWindowTitle(m_pCompanionWindow, strWindowTitle.c_str());
++
++	if (!BInitGLFramebuffers3dPlatform())
++	{
++		printf("%s - Unable to initialize framebuffers!\n", __FUNCTION__);
++		return false;
++	}
+ 
+-bool PCApplication::BInitGL()
++	return true;
++}
++
++bool PCApplication::BInitGL(uint8_t* colorData, uint8_t* depthData)
+ {
+-	if (!Application::BInitGL()) {
++	if (!Application::BInitGL(colorData, depthData)) {
+ 		return false;
+ 	}
++	auto timeA = std::chrono::high_resolution_clock::now();
++
++	framebuffers.init(inputCameras, options.SCR_WIDTH, options.SCR_HEIGHT, options);
++    auto timeB = std::chrono::high_resolution_clock::now();
++    std::chrono::duration<double, std::milli> elapsed1 = timeB - timeA;
++	std::cout << "[INFO] DIBR: PCApplication::BInitGL time: " << elapsed1.count() << " ms\n";
++
++	return true;
++}
++
++bool PCApplication::BInitGLPre3dPlatform()
++{
++	if (!Application::BInitGLPre3dPlatform()) {
++		return false;
++	}
++	printf("[INFO] DIBR: PCApplication::BInitGLPre3dPlatform()\n");
++	return true;
++}
++
++bool PCApplication::BInitGLTotal3dPlatform(uint8_t* colorData, uint8_t* depthData)
++{
++	if (!Application::BInitGL(colorData, depthData)) {
++		return false;
++	}
++	printf("[INFO] DIBR: PCApplication::BInitGLTotal3dPlatform()\n");
++	return true;
++}
++
++bool PCApplication::BInitGLFramebuffers3dPlatform()
++{
+ 	framebuffers.init(inputCameras, options.SCR_WIDTH, options.SCR_HEIGHT, options);
+ 	return true;
+ }
+diff --git a/src/VRApplication.h b/src/VRApplication.h
+index b9fc72d..2c7116d 100644
+--- a/src/VRApplication.h
++++ b/src/VRApplication.h
+@@ -151,12 +151,12 @@ bool VRApplication::BInit()
+ 		std::cout << "VRInput()->GetInputSourceHandle failed." << std::endl;
+ 	}
+ 
+-	return Application::BInit();
++	return Application::BInit(NULL, NULL);
+ }
+ 
+ bool VRApplication::BInitGL()
+ {
+-	if (!Application::BInitGL()) {
++	if (!Application::BInitGL(NULL, NULL)) {
+ 		return false;
+ 	}
+ 	framebuffers.init(inputCameras, m_nRenderWidth, m_nRenderHeight, options);
+diff --git a/src/main.cpp b/src/main.cpp
+index 9381cfa..566e374 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -9,12 +9,20 @@
+ #include <string>
+ #include "cxxopts.hpp"
+ #include "ioHelper.h"
++#include <chrono>
+ #include "AppDecUtils.h"
++#include <iostream>
++#include <thread>
+ 
+ 
+ // From CMAKE preprocessor
+ std::string cmakelists_dir = CMAKELISTS_SOURCE_DIR;
+ 
++// resolution定义
++int RES_1K = 0;
++int RES_2K = 1;
++// open-dibr项目参数输入数量
++int OPEN_DIBR_ARGC = 9;
+ 
+ class Options {
+ public:
+@@ -451,36 +459,165 @@ private:
+ #include "VRApplication.h"
+ #include "PCApplication.h"
+ 
++PCApplication *pMainApplicationLeft;
++PCApplication *pMainApplicationRight;
++
++char* dibrBin;
++char* sunshineAssetDir;
++char* dibr1kOutputJsonPath;
++char* dibr2kOutputJsonPath;
++char* dibrLeftOMAF1kInputJson;
++char* dibrLeftOMAF2kInputJson;
++char* dibrRightOmaf1kInputJson;
++char* dibrRightOmaf2kInputJson;
++
++void getEnvOrDefault(char** pathSetting, char* envSetting, char* defaultSetting) {
++	if(!(*pathSetting = getenv(envSetting))){
++		printf("pathSetting = defaultSetting;...\n");
++		*pathSetting = defaultSetting;
++	}
++	printf("%s is set to %s\n", envSetting, *pathSetting);
++}
+ 
+-int main(int argc, char* argv[]){
++void DIBRParamInit() {
++	printf("[INFO] DIBRParamInit...\n");
++	getEnvOrDefault(&dibrBin, "DIBR_BIN", "/home/zhike/公共的/c30041999/code/open-dibr/bin/RealtimeDIBR");
++	getEnvOrDefault(&sunshineAssetDir, "SUNSHINE_ASSET_DIR", "/home/zhike/公共的/c30041999/code/sunshine/asset");
++	getEnvOrDefault(&dibr1kOutputJsonPath, "DIBR_1K_OUPUT_JSON_PATH", "/home/zhike/公共的/c30041999/code/sunshine/asset/example_opengl_1k.json");
++	getEnvOrDefault(&dibr2kOutputJsonPath, "DIBR_2K_OUPUT_JSON_PATH", "/home/zhike/公共的/c30041999/code/sunshine/asset/example_opengl_2k.json");
++	getEnvOrDefault(&dibrLeftOMAF1kInputJson, "DIBR_LEFT_OMAF_1K_INPUT_JSON", "/home/zhike/公共的/c30041999/code/sunshine/asset/left_omaf_1k.json");
++	getEnvOrDefault(&dibrLeftOMAF2kInputJson, "DIBR_LEFT_OMAF_2K_INPUT_JSON", "/home/zhike/公共的/c30041999/code/sunshine/asset/left_omaf_2k.json");
++	getEnvOrDefault(&dibrRightOmaf1kInputJson, "DIBR_RIGHT_OMAF_1K_INPUT_JSON", "/home/zhike/公共的/c30041999/code/sunshine/asset/right_omaf_1k.json");
++	getEnvOrDefault(&dibrRightOmaf2kInputJson, "DIBR_RIGHT_OMAF_2K_INPUT_JSON", "/home/zhike/公共的/c30041999/code/sunshine/asset/right_omaf_2k.json");
++	printf("[INFO] Param init success.\n");
++}
+ 
+-	Options options = Options(argc, argv);
++int DIBRFirstInit(bool outputLeft) {
++	printf("[INFO] DIBRFirstInit...\n");
++	DIBRParamInit();
++	int resolution = RES_1K;
++	int inpArgc = OPEN_DIBR_ARGC; // open-dibr项目的原始设置参数数量
++	int dibrInputJsonPathIdx = 6;
++
++	char* inpArgv[] = {
++		dibrBin,
++		"-i", sunshineAssetDir,
++		"-j", dibr1kOutputJsonPath,
++		"-p", "",
++		"-o", sunshineAssetDir
++	};
++	
++	if (outputLeft) {
++		inpArgv[dibrInputJsonPathIdx] = (resolution == RES_1K) ? dibrLeftOMAF1kInputJson : dibrLeftOMAF2kInputJson;
++	} else {
++		inpArgv[dibrInputJsonPathIdx] = (resolution == RES_1K) ? dibrRightOmaf1kInputJson : dibrRightOmaf2kInputJson;
++	}
+ 
++	Options options = Options(inpArgc, inpArgv);
+ 	FpsMonitor fpsMonitor(options.useVR);
+ 
+-	if (options.useVR) {
+-		VRApplication pMainApplication(options, &fpsMonitor, options.inputCameras);
+-		if (!pMainApplication.BInit())
++	if (outputLeft) {
++		pMainApplicationLeft = new PCApplication(options, &fpsMonitor, options.inputCameras, options.outputCameras);
++		if (!pMainApplicationLeft->BInit3dPlatform())
+ 		{
+-			pMainApplication.Shutdown();
++			pMainApplicationLeft->Shutdown();
+ 			return 1;
+ 		}
+-		pMainApplication.RunMainLoop();
+-		pMainApplication.Shutdown();
+-	}
+-	else {
+-		PCApplication pMainApplication(options, &fpsMonitor, options.inputCameras, options.outputCameras);
+-		if (!pMainApplication.BInit())
++	} else {
++		pMainApplicationRight = new PCApplication(options, &fpsMonitor, options.inputCameras, options.outputCameras);
++		if (!pMainApplicationRight->BInit3dPlatform())
+ 		{
+-			pMainApplication.Shutdown();
++			pMainApplicationRight->Shutdown();
+ 			return 1;
+ 		}
+-		pMainApplication.RunMainLoop();
+-		pMainApplication.Shutdown();
+ 	}
+ 
+-	if (options.useFpsMonitor) {
+-		fpsMonitor.WriteToCSVFile(options.fpsCsvPath, options.isStatic);
++	return 0;
++}
++
++int DIBRBInitGLTotal(PCApplication *pMainApplication, uint8_t* colorData, uint8_t* depthData) {
++	printf("[INFO] DIBRBInitGLTotal...\n");
++	if (colorData == nullptr || depthData == nullptr) {
++		std::cout << "[ERROR] colorData or depthData is null." << std::endl;
++		return 1;	
++	}
++	if (!pMainApplication->BInitGLTotal3dPlatform(colorData, depthData)) {
++		pMainApplication->Shutdown();
++		return 1;
++	}
++	
++	return 0;
++}
++
++int DIBRBInitGLPre(bool outputLeft) {
++	printf("[INFO] DIBRBInitGLPre...\n");
++
++	PCApplication* pMainApplication = nullptr;
++	if (outputLeft) {
++		pMainApplication = pMainApplicationLeft;
++	} else {
++		pMainApplication = pMainApplicationRight;
++	}
++	
++	if (!pMainApplication->BInitGLPre3dPlatform()) {
++		pMainApplication->Shutdown();
++		return 1;
++	}
++	return 0;
++}
++
++int DIBRBInitGLTexture(PCApplication *pMainApplication, uint8_t* colorData, uint8_t* depthData) {
++	printf("[INFO] DIBRBInitGLTexture...\n");
++	if (colorData == nullptr || depthData == nullptr) {
++		std::cout << "[ERROR] colorData or depthData is null." << std::endl;
++		return 1;	
++	}
++	if (!pMainApplication->BInitGLTexture3dPlatform(colorData, depthData)) {
++		pMainApplication->Shutdown();
++		return 1;
++	}
++	
++	return 0;
++}
++
++int DIBRRunMainLoop(PCApplication *pMainApplication, uint8_t** resultImg) {
++	pMainApplication->RunMainLoop();
++	*resultImg = pMainApplication->GetResultImg();
++	return 0;
++}
++
++int DIBRShutdown(PCApplication *pMainApplication) {
++	printf("[INFO] DIBRShutdown...\n");
++	pMainApplication->Shutdown3dPlatform();
++	return 0;
++}
++
++int DIBRShutdownAll(PCApplication *pMainApplication) {
++	printf("[INFO] DIBRShutdownAll...\n");
++	pMainApplication->Shutdown();
++	return 0;
++}
++
++int DIBRFlagTest(uint8_t* colorData, uint8_t* depthData, uint8_t** resultImg, bool outputLeft, uint8_t flag) {
++	PCApplication* pMainApplication = nullptr;
++	if (outputLeft) {
++		pMainApplication = pMainApplicationLeft;
++	} else {
++		pMainApplication = pMainApplicationRight;
+ 	}
++
++	if (flag == 0) {
++		printf("[INFO] DIBRFlagTest Flag=0...\n");
++		DIBRFirstInit(outputLeft);
++		DIBRBInitGLPre(outputLeft);
++	} else if ( flag == 1 ) {
++		printf("[INFO] DIBRFlagTest Flag=1...\n");
++		DIBRBInitGLTexture(pMainApplication, colorData, depthData);
++		DIBRRunMainLoop(pMainApplication, resultImg);
++	} else if (flag == 2) {
++		printf("[INFO] DIBRFlagTest Flag=2...\n");
++		DIBRShutdownAll(pMainApplication);
++	}
++
+ 	return 0;
+ }
