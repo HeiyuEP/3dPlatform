@@ -1084,6 +1084,14 @@ namespace cuda {
       }
 
 #ifdef SUNSHINE_HARDWARD_ENCODE
+      static void 
+      free_img_data(uint8_t* data) {
+        if(data != nullptr) {
+          delete data;
+          data=nullptr;
+        }
+      }
+
       static void get_depth_img() {
         BOOST_LOG(info) << "Starting get_depth_img thread.";
         GenerateDepthImg* depth_model = nullptr;
@@ -1095,13 +1103,11 @@ namespace cuda {
           BOOST_LOG(error) << "GenerateDepthImg alloc failed!";
           return;
         }
-
         depth_data = new uint8_t[depth_size];
         if (depth_data == nullptr) {
           BOOST_LOG(error) << "depth_data alloc failed!";
           goto CLEANUP;
         }
-
         src_rgb_data = new uint8_t[src_rgb_size];
         if (src_rgb_data == nullptr) {
           BOOST_LOG(error) << "src_rgb_data alloc failed!";
@@ -1133,14 +1139,8 @@ namespace cuda {
             delete depth_model;
             depth_model = nullptr;
           }
-          if (depth_data != nullptr) {
-            delete depth_data;
-            depth_data = nullptr;
-          }
-          if (src_rgb_data != nullptr) {
-            delete src_rgb_data;
-            src_rgb_data = nullptr;
-          }
+          free_img_data(depth_data);
+          free_img_data(src_rgb_data);
       }
 
       static void
@@ -1159,14 +1159,12 @@ namespace cuda {
           BOOST_LOG(error) << "src_rgb_image alloc failed!";
           goto CLEANUP;
         }
-
 #if LATENCY_TEST
         depth_model->LatencyTest(src_image_qd.data, src_rgb_data, depth_data);
 #else
         depth_model->Execute(src_image_qd.data, src_rgb_data, depth_data);
 #endif
         delete src_image_qd.data;
-
         ret = memcpy_s(depth_image, depth_size, depth_data, depth_size);
         if (ret != EOK) {
           BOOST_LOG(error) << "depth_data memcpy failed! error code: " << ret;
@@ -1187,7 +1185,18 @@ namespace cuda {
         src_rgb_image_qd.timestamp = src_image_qd.timestamp;
 
         BOOST_LOG(info) << "get_depth_img: Ready for Raise.";
+        push_new_img_to_queue(depth_image_qd, src_rgb_image_qd);
+        BOOST_LOG(info) << "get_depth_img: Raise completed.";
+        return;
 
+        CLEANUP:
+          free_img_data(depth_image);
+          free_img_data(src_rgb_image);
+          BOOST_LOG(error) << "execute_depthV2_model: CLEAN-UP.";
+          return;
+      }
+
+      static void push_new_img_to_queue(img_queue_data depth_image_qd, img_queue_data src_rgb_image_qd) {
         {
           std::lock_guard<std::mutex> lock(mtx_depth_images);
           if (depth_images.size() >= MAX_CAPTURE_FRAME_COUNT) {
@@ -1202,21 +1211,6 @@ namespace cuda {
           src_rgb_images.push(src_rgb_image_qd);
         }
         cv_depth_images.notify_one();
-
-        BOOST_LOG(info) << "get_depth_img: Raise completed.";
-        return;
-
-        CLEANUP:
-          if (depth_image != nullptr) {
-            delete depth_image;
-            depth_image = nullptr;
-          }
-          if (src_rgb_image != nullptr) {
-            delete src_rgb_image;
-            src_rgb_image = nullptr;
-          }
-          BOOST_LOG(error) << "execute_depthV2_model: CLEAN-UP.";
-          return;
       }
 
       static void get_3D_img() {
@@ -1306,15 +1300,11 @@ namespace cuda {
         img->tex.copyToDevice(result_img, img->height, img->row_pitch);
 
         CLEANUP:
-          delete result_img;
-          delete left_3d_result;
-          delete right_3d_result;
-          delete concated_img_data;
-          delete resized_img_data;
-          left_3d_result = nullptr;
-          right_3d_result = nullptr;
-          concated_img_data = nullptr;
-          resized_img_data = nullptr;
+          free_img_data(result_img);
+          free_img_data(left_3d_result);
+          free_img_data(right_3d_result);
+          free_img_data(concated_img_data);
+          free_img_data(resized_img_data);
       }
 
       static void concatenate_filp_images(uint8_t* img_data_left, uint8_t* img_data_right, img_size single_width_img, uint8_t** new_data) {
