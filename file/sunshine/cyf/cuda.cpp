@@ -51,10 +51,12 @@ namespace fs = std::filesystem;
 #ifdef SUNSHINE_HARDWARD_ENCODE
   extern int DIBRFlagTest(uint8_t* colorData, uint8_t* depth_data, uint8_t** resultImg, bool outputLeft, uint8_t flag);
   extern int MAX_CAPTURE_FRAME_COUNT;
-  static int depth_to_dibr_img_count = 0;
   int src_rgb_image_width = 1920;
   int src_rgb_image_height = 1080;
-  int src_rgba_image_channel = 4;
+  int rgba_image_channel = 4;
+  int rgb_image_channel = 3;
+  size_t depth_size = src_rgb_image_width*src_rgb_image_height;
+  size_t src_rgb_size = src_rgb_image_width*src_rgb_image_height*rgb_image_channel;
 #endif
 
 using namespace std::literals;
@@ -828,6 +830,9 @@ namespace cuda {
 
       void clear_queue(std::queue<img_queue_data> &queue) {
         while (!queue.empty()) {
+          img_queue_data &front = queue.front();
+          delete front.imgT;
+          delete[] front.data;
           queue.pop();
         }
       }
@@ -863,7 +868,6 @@ namespace cuda {
 #endif
 
         while (true) {
-          BOOST_LOG(info) << "pre-snapshot.";
           auto now = std::chrono::steady_clock::now();
           if (next_frame > now) {
             std::this_thread::sleep_for(next_frame - now);
@@ -875,7 +879,6 @@ namespace cuda {
           if (next_frame < now) {  // some major slowdown happened; we couldn't keep up
             next_frame = now + delay;
           }
-          BOOST_LOG(info) << "ready to snap shot..";
 
           std::shared_ptr<platf::img_t> img_out;
           auto status = snapshot(pull_free_image_cb, img_out, 150ms, *cursor);
@@ -984,12 +987,7 @@ namespace cuda {
       }
 
       platf::capture_e
-      snapshot(
-        const pull_free_image_cb_t &pull_free_image_cb,
-        std::shared_ptr<platf::img_t> &img_out, 
-        std::chrono::milliseconds timeout, 
-        bool cursor) {
-        BOOST_LOG(info) << "snapshot";
+      snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor) {
         if (cursor != cursor_visible) {
           auto status = reinit(cursor);
           if (status != platf::capture_e::ok) {
@@ -1088,23 +1086,26 @@ namespace cuda {
 #ifdef SUNSHINE_HARDWARD_ENCODE
       static void get_depth_img() {
         BOOST_LOG(info) << "Starting get_depth_img thread.";
-        int channel = 4;
-        GenerateDepthImg* depth = new GenerateDepthImg(src_rgb_image_width,src_rgb_image_height,channel);
-        if (depth == nullptr) {
+        GenerateDepthImg* depth_model = nullptr;
+        std::uint8_t *depth_data = nullptr;
+        std::uint8_t *src_rgb_data = nullptr;
+
+        depth_model = new GenerateDepthImg(src_rgb_image_width,src_rgb_image_height,rgba_image_channel);
+        if (depth_model == nullptr) {
           BOOST_LOG(error) << "GenerateDepthImg alloc failed!";
           return;
         }
-        size_t depth_size = src_rgb_image_width*src_rgb_image_height;
-        std::uint8_t *depth_data = new uint8_t[depth_size];
+
+        depth_data = new uint8_t[depth_size];
         if (depth_data == nullptr) {
           BOOST_LOG(error) << "depth_data alloc failed!";
-          return;
+          goto CLEANUP;
         }
-        size_t src_rgb_size = src_rgb_image_width*src_rgb_image_height*3;
-        std::uint8_t *src_rgb_data = new uint8_t[src_rgb_size];
+
+        src_rgb_data = new uint8_t[src_rgb_size];
         if (src_rgb_data == nullptr) {
           BOOST_LOG(error) << "src_rgb_data alloc failed!";
-          return;
+          goto CLEANUP;
         }
 
         std::chrono::duration<double, std::milli> time_cost_get_depth_img;        
@@ -1121,24 +1122,33 @@ namespace cuda {
               continue;
             }
           }
-          execute_depthV2_model(depth, src_image_qd, src_rgb_data, depth_data, depth_size, src_rgb_size);
+          execute_depthV2_model(depth_model, src_image_qd, src_rgb_data, depth_data);
           auto time_b = std::chrono::high_resolution_clock::now();
           time_cost_get_depth_img = time_b - time_a;
           BOOST_LOG(info) << "time_cost_get_depth_img: " << time_cost_get_depth_img.count() << "ms";
         }
-        if (depth_data != nullptr) {
-          delete depth_data;
-          depth_data = nullptr;
-        }
-        if (src_rgb_data != nullptr) {
-          delete src_rgb_data;
-          src_rgb_data = nullptr;
-        }
-        delete depth;
+
+        CLEANUP:
+          if (depth_model != nullptr) {
+            delete depth_model;
+            depth_model = nullptr;
+          }
+          if (depth_data != nullptr) {
+            delete depth_data;
+            depth_data = nullptr;
+          }
+          if (src_rgb_data != nullptr) {
+            delete src_rgb_data;
+            src_rgb_data = nullptr;
+          }
       }
 
       static void
-      execute_depthV2_model(GenerateDepthImg* depth, img_queue_data src_image_qd, std::uint8_t *src_rgb_data, std::uint8_t *depth_data, size_t depth_size, size_t src_rgb_size) {
+      execute_depthV2_model(GenerateDepthImg* depth_model, img_queue_data src_image_qd, std::uint8_t *src_rgb_data, std::uint8_t *depth_data) {
+        int ret;
+        img_queue_data depth_image_qd;
+        img_queue_data src_rgb_image_qd;
+        
         uint8_t* depth_image = new uint8_t[depth_size];
         if (depth_image == nullptr) {
           BOOST_LOG(error) << "depth_image alloc failed!";
@@ -1147,24 +1157,31 @@ namespace cuda {
         uint8_t* src_rgb_image = new uint8_t[src_rgb_size];
         if (src_rgb_image == nullptr) {
           BOOST_LOG(error) << "src_rgb_image alloc failed!";
-          return;
+          goto CLEANUP;
         }
 
 #if LATENCY_TEST
-        depth->LatencyTest(src_image_qd.data, src_rgb_data, depth_data);
+        depth_model->LatencyTest(src_image_qd.data, src_rgb_data, depth_data);
 #else
-        depth->Execute(src_image_qd.data, src_rgb_data, depth_data);
+        depth_model->Execute(src_image_qd.data, src_rgb_data, depth_data);
 #endif
         delete src_image_qd.data;
 
-        memcpy_s(depth_image, depth_size, depth_data, depth_size);
-        memcpy_s(src_rgb_image, src_rgb_size, src_rgb_data, src_rgb_size);
-        img_queue_data depth_image_qd;
+        ret = memcpy_s(depth_image, depth_size, depth_data, depth_size);
+        if (ret != EOK) {
+          BOOST_LOG(error) << "depth_data memcpy failed! error code: " << ret;
+          goto CLEANUP;
+        }
+        ret = memcpy_s(src_rgb_image, src_rgb_size, src_rgb_data, src_rgb_size);
+        if (ret != EOK) {
+          BOOST_LOG(error) << "src_rgb_data memcpy failed! error code: " << ret;
+          goto CLEANUP;
+        }
+
         depth_image_qd.imgT = src_image_qd.imgT;
         depth_image_qd.data = depth_image;
         depth_image_qd.timestamp = src_image_qd.timestamp;
 
-        img_queue_data src_rgb_image_qd;
         src_rgb_image_qd.imgT = src_image_qd.imgT;
         src_rgb_image_qd.data = src_rgb_image;
         src_rgb_image_qd.timestamp = src_image_qd.timestamp;
@@ -1185,9 +1202,21 @@ namespace cuda {
           src_rgb_images.push(src_rgb_image_qd);
         }
         cv_depth_images.notify_one();
-        
-        depth_to_dibr_img_count++;
+
         BOOST_LOG(info) << "get_depth_img: Raise completed.";
+        return;
+
+        CLEANUP:
+          if (depth_image != nullptr) {
+            delete depth_image;
+            depth_image = nullptr;
+          }
+          if (src_rgb_image != nullptr) {
+            delete src_rgb_image;
+            src_rgb_image = nullptr;
+          }
+          BOOST_LOG(error) << "execute_depthV2_model: CLEAN-UP.";
+          return;
       }
 
       static void get_3D_img() {
@@ -1217,7 +1246,6 @@ namespace cuda {
               continue;
             }
           }
-          depth_to_dibr_img_count--;
 #if LATENCY_TEST
           get_3D_img_no_render(src_rgb_image_qd, depth_image_qd);
 #else
@@ -1253,34 +1281,40 @@ namespace cuda {
       }
 
       static void get_result_img(uint8_t* left_3d_result, uint8_t* right_3d_result, img_queue_data depth_image_qd) {
+        int ret;
+        auto img = depth_image_qd.imgT;
         img_size single_width_img;
         single_width_img.width = src_rgb_image_width;
         single_width_img.height = src_rgb_image_height;
-        single_width_img.channel = src_rgba_image_channel;
+        single_width_img.channel = rgba_image_channel;
 
         uint8_t* concated_img_data = nullptr;
         concatenate_filp_images(left_3d_result, right_3d_result, single_width_img, &concated_img_data);
         uint8_t* resized_img_data = nullptr;
         half_width_image(concated_img_data, &resized_img_data, single_width_img);
-        uint8_t* result_img = new uint8_t[src_rgb_image_width*src_rgb_image_height*src_rgba_image_channel];
+        uint8_t* result_img = new uint8_t[src_rgb_image_width*src_rgb_image_height*rgba_image_channel];
         if (result_img == nullptr) {
-          BOOST_LOG(error) << "result_img alloc failed!";
+          BOOST_LOG(error) << "get_result_img: result_img alloc failed!";
           return;
         }
-        memcpy_s(result_img, src_rgb_image_width*src_rgb_image_height*src_rgba_image_channel, resized_img_data, src_rgb_image_width*src_rgb_image_height*src_rgba_image_channel);
+        ret = memcpy_s(result_img, src_rgb_image_width*src_rgb_image_height*rgba_image_channel, resized_img_data, src_rgb_image_width*src_rgb_image_height*rgba_image_channel);
+        if (ret != EOK) {
+          BOOST_LOG(error) << "get_result_img: resized_img_data memcpy failed! error code: " << ret;
+          goto CLEANUP;
+        }
 
-        auto img = depth_image_qd.imgT;
         img->tex.copyToDevice(result_img, img->height, img->row_pitch);
-        
-        delete result_img;
-        delete left_3d_result;
-        delete right_3d_result;
-        delete concated_img_data;
-        delete resized_img_data;
-        left_3d_result = nullptr;
-        right_3d_result = nullptr;
-        concated_img_data = nullptr;
-        resized_img_data = nullptr;
+
+        CLEANUP:
+          delete result_img;
+          delete left_3d_result;
+          delete right_3d_result;
+          delete concated_img_data;
+          delete resized_img_data;
+          left_3d_result = nullptr;
+          right_3d_result = nullptr;
+          concated_img_data = nullptr;
+          resized_img_data = nullptr;
       }
 
       static void concatenate_filp_images(uint8_t* img_data_left, uint8_t* img_data_right, img_size single_width_img, uint8_t** new_data) {
